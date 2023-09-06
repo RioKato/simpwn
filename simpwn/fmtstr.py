@@ -68,7 +68,7 @@ def fmtstr(idx: int, write: list[tuple[int, bytes]],
 
         return result
 
-    def gen(idx: int, write: list[tuple[int, int, str]]) -> bytes:
+    def concat(write: list[tuple[int, int, str]]) -> bytes:
         size = 8 if not bit32 else 4
 
         def align(n: int) -> int:
@@ -100,9 +100,8 @@ def fmtstr(idx: int, write: list[tuple[int, bytes]],
         while True:
             payload = fmt.format(*list(range(i, i+len(write))))
             payload = payload.ljust(align(len(payload)), 'X')
-            idx_ = idx+len(payload)//size
 
-            if i == idx_:
+            if i == idx+len(payload)//size:
                 break
 
             i += 1
@@ -111,4 +110,4 @@ def fmtstr(idx: int, write: list[tuple[int, bytes]],
         payload += hooter
         return payload
 
-    return gen(idx, split(normalize(write)))
+    return concat(split(normalize(write)))

@@ -1,16 +1,15 @@
-from typing import Any, Callable, Iterator, Protocol, Self, Type, cast
+from contextlib import suppress
+from typing import Any, Callable, Iterator, NoReturn, Protocol, Self, Type, cast
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
 from functools import wraps
 
 
 class Config:
-    from pathlib import Path
-
     env: dict[str, str] = {}
     aslr: bool = True
     dbg: str = ''
-    script: str = str(Path(__file__).parent.joinpath('init.dbg'))
+    script: str = 'init.gdb'
     opt: list[str] = []
     term: list[str] = ['tmux', 'split', '-h']
     gdb: str = 'gdb'
@@ -21,18 +20,14 @@ class Config:
 
     @classmethod
     def init(cls):
-        from pathlib import Path
-
         path = [
             '~/.simpwn.json',
-            str(Path(__file__).parent.joinpath('simpwn.json'))
+            'simpwn.json'
         ]
 
         for i in path:
-            try:
+            with suppress(FileNotFoundError):
                 cls.load(i)
-            except FileNotFoundError:
-                pass
 
     @classmethod
     def load(cls, path: str):
@@ -42,10 +37,8 @@ class Config:
             data = load(fd)
 
         for (k, v) in data.items():
-            try:
+            with suppress(AttributeError):
                 setattr(cls, k, v)
-            except AttributeError:
-                pass
 
     @classmethod
     def quiet(cls):
@@ -163,18 +156,90 @@ def ror64(value: int, n: int) -> int:
     return rol64(value, -n)
 
 
-_iota: Iterator[bytes] | None = None
-
-
-def iota() -> bytes:
+class Iota:
     from itertools import cycle
     from string import digits, ascii_letters
 
-    global _iota
-    if not _iota:
-        _iota = cycle(c.encode() for c in digits+ascii_letters)
+    seed: Iterator[bytes] = cycle(c.encode() for c in digits+ascii_letters)
 
-    return next(_iota)
+    @classmethod
+    def get(cls) -> bytes:
+        return next(cls.seed)
+
+
+def iota() -> bytes:
+    return Iota.get()
+
+
+class DeBruijn:
+    @staticmethod
+    def seq(k: int, n: int) -> Iterator[int]:
+        a = [0]*k*n
+
+        def recur(t: int, p: int) -> Iterator[int]:
+            if t > n:
+                if not n % p:
+                    yield from a[1:p+1]
+
+            else:
+                a[t] = a[t-p]
+                yield from recur(t+1, p)
+
+                for i in range(a[t-p]+1, k):
+                    a[t] = i
+                    yield from recur(t+1, t)
+
+        return recur(1, 1)
+
+    def __init__(self, orign: list[bytes] | None = None, n: int = 8):
+        from string import digits, ascii_letters
+
+        if orign is None:
+            orign = list(c.encode() for c in digits+ascii_letters)
+
+        assert (all(len(c) == 1 for c in orign))
+
+        self._orign: list[bytes] = orign
+        self._n: int = n
+        self._seed: Iterator[bytes] = (
+            orign[c] for c in DeBruijn.seq(len(orign), n))
+
+    def take(self, n: int) -> bytes:
+        from itertools import islice
+        return b''.join(islice(self._seed, n))
+
+    def find(self, key: bytes) -> int:
+        assert (len(key) == self._n)
+        map = dict((j[0], i) for (i, j) in enumerate(self._orign))
+        ikey = [map[c] for c in key]
+
+        data = []
+        for c in DeBruijn.seq(len(self._orign), self._n):
+            if data[-self._n:] == ikey:
+                return len(data)-self._n
+            data.append(c)
+
+        raise ValueError
+
+
+class UniqSeq:
+    db: DeBruijn = DeBruijn()
+
+    @classmethod
+    def take(cls, n: int) -> bytes:
+        return cls.db.take(n)
+
+    @classmethod
+    def find(cls, key: bytes) -> int:
+        return cls.db.find(key)
+
+
+def uniqseq(n: int) -> bytes:
+    return UniqSeq.take(n)
+
+
+def uniqfind(key: bytes) -> int:
+    return UniqSeq.find(key)
 
 
 def shstr(command: str) -> list[str]:
@@ -182,7 +247,7 @@ def shstr(command: str) -> list[str]:
     return split(command)
 
 
-_COLOR = dict(
+_COLOR: dict[str, str] = dict(
     END='\033[0m',
     BOLD='\033[1m',
     UNDERLINE='\033[4m',
@@ -327,17 +392,11 @@ class Tube(metaclass=ABCMeta):
         self._rbuf: bytes = b''
 
     def send(self, data: bytes):
-        if self._sbuf:
-            data, self._sbuf = self._sbuf+data, b''
+        self._sbuf += data
 
-        try:
-            while data:
-                n = self._send(data)
-                data = data[n:]
-
-        except Exception as e:
-            self._sbuf = data+self._sbuf
-            raise e
+        while self._sbuf:
+            n = self._send(self._sbuf)
+            self._sbuf = self._sbuf[n:]
 
     def sendline(self, data: bytes):
         self.send(data+b'\n')
@@ -350,34 +409,18 @@ class Tube(metaclass=ABCMeta):
         return self._recv(size)
 
     def recvexact(self, n: int, size: int = 0x1000) -> bytes:
-        data = b''
+        while len(self._rbuf) < n:
+            self._rbuf += self._recv(size=size)
 
-        try:
-            while len(data) < n:
-                data += self.recv(size=size)
-
-        except Exception as e:
-            self._rbuf = data+self._rbuf
-            raise e
-
-        data, rest = data[:n], data[n:]
-        self._rbuf = rest+self._rbuf
+        data, self._rbuf = self._rbuf[:n], self._rbuf[n:]
         return data
 
     def recvuntil(self, delim: bytes, size: int = 0x1000) -> bytes:
-        data = b''
-
-        try:
-            while (pos := data.find(delim)) == -1:
-                data += self.recv(size=size)
-
-        except Exception as e:
-            self._rbuf = data+self._rbuf
-            raise e
+        while (pos := self._rbuf.find(delim)) == -1:
+            self._rbuf += self._recv(size=size)
 
         pos += len(delim)
-        data, rest = data[:pos], data[pos:]
-        self._rbuf = rest+self._rbuf
+        data, self._rbuf = self._rbuf[:pos], self._rbuf[pos:]
         return data
 
     def recvline(self, size: int = 0x1000) -> bytes:
@@ -394,45 +437,36 @@ class Tube(metaclass=ABCMeta):
         return buf
 
     def interactive(self, size: int = 0x1000):
-        from select import epoll, EPOLLIN, EPOLLERR, EPOLLHUP
-        from os import read, write
-        from ssl import SSLWantReadError
+        from os import read, write, O_NONBLOCK
+        from ssl import SSLWantReadError, SSLWantWriteError
+        from fcntl import fcntl, F_GETFL, F_SETFL
 
         timeout = self.gettimeout()
+        self.settimeout(0)
 
         try:
-            with epoll(1) as epollfd:
-                epollfd.register(0, EPOLLIN)
+            fl = fcntl(0, F_GETFL)
+            fcntl(0, F_SETFL, fl | O_NONBLOCK)
 
-                try:
+            try:
+                with suppress(KeyboardInterrupt):
                     while True:
-                        try:
-                            self.settimeout(0)
-                            buf = self.recv(size)
+                        with suppress(BlockingIOError, SSLWantReadError):
+                            self._rbuf += self._recv(size)
 
-                        except (BlockingIOError, SSLWantReadError):
-                            pass
+                        with suppress(BlockingIOError):
+                            self._sbuf += read(0, size)
 
-                        else:
-                            while buf:
-                                n = write(1, buf)
-                                buf = buf[n:]
+                        with suppress(BlockingIOError, SSLWantWriteError):
+                            n = self._send(self._sbuf)
+                            self._sbuf = self._sbuf[n:]
 
-                        if ev := dict(epollfd.poll(0)):
-                            def chkfd(fd: int, flag: int) -> bool:
-                                return bool(ev.get(fd, 0) & flag)
+                        with suppress(BlockingIOError):
+                            n = write(1, self._rbuf)
+                            self._rbuf = self._rbuf[n:]
 
-                            if chkfd(0, EPOLLIN):
-                                buf = read(0, size)
-                                self.settimeout(None)
-                                self.send(buf)
-
-                            else:
-                                assert (chkfd(0, EPOLLERR | EPOLLHUP))
-                                raise BrokenPipeError
-
-                except KeyboardInterrupt:
-                    pass
+            finally:
+                fcntl(0, F_SETFL, fl)
 
         finally:
             self.settimeout(timeout)
@@ -448,7 +482,6 @@ class Tube(metaclass=ABCMeta):
 
 
 class Net:
-    from socket import socket
     from ssl import SSLContext
 
     @staticmethod
@@ -459,8 +492,30 @@ class Net:
         context.verify_mode = CERT_NONE
         return context
 
+
+class Remote(Tube):
+    from socket import socket
+    from ssl import SSLContext
+
+    @classmethod
+    def run(cls,
+            host: str, port: int,
+            udp: bool = False,
+            ipv6: bool = False,
+            ssl: SSLContext | None = None) -> Self:
+
+        sk = cls.multisk(udp, ipv6, ssl)
+
+        try:
+            sk.connect((host, port))
+            return cls(sk)
+
+        except Exception as e:
+            sk.close()
+            raise e
+
     @staticmethod
-    def _socket(udp: bool, ipv6: bool, ssl: SSLContext | None) -> socket:
+    def multisk(udp: bool, ipv6: bool, ssl: SSLContext | None) -> socket:
         from socket import socket, SOL_SOCKET, SO_REUSEADDR
         from socket import AF_INET, AF_INET6, SOCK_STREAM, SOCK_DGRAM, IPPROTO_TCP, IPPROTO_UDP
 
@@ -477,28 +532,6 @@ class Net:
                 sk = ssl.wrap_socket(sk)
 
             return sk
-
-        except Exception as e:
-            sk.close()
-            raise e
-
-
-class Remote(Tube):
-    from socket import socket
-    from ssl import SSLContext
-
-    @classmethod
-    def run(cls,
-            host: str, port: int,
-            udp: bool = False,
-            ipv6: bool = False,
-            ssl: SSLContext | None = None) -> Self:
-
-        sk = Net._socket(udp, ipv6, ssl)
-
-        try:
-            sk.connect((host, port))
-            return cls(sk)
 
         except Exception as e:
             sk.close()
@@ -560,9 +593,10 @@ class ProcessMonitoringError(Exception):
 class ProcessManager:
     from subprocess import Popen
 
-    def __init__(self, *proc: Popen):
+    def __init__(self, *proc: Popen, timeout: float = 0.1):
         from subprocess import Popen
         self._proc: list[Popen] = list(proc)
+        self._timeout: float = timeout
 
     def move(self, *proc: Popen):
         self._proc += list(proc)
@@ -572,13 +606,11 @@ class ProcessManager:
 
         for p in self._proc:
             try:
-                if p.poll() is not None:
-                    p.terminate()
-                p.wait(0.1)
+                p.terminate()
+                p.wait(self._timeout)
 
             except TimeoutExpired:
-                if p.poll() is not None:
-                    p.kill()
+                p.kill()
                 p.wait()
 
 
@@ -606,21 +638,9 @@ class Debugger(metaclass=ABCMeta):
 
 
 class AttachProtocol(Protocol):
-    @property
-    def _manager(self) -> ProcessManager:
-        ...
-
-    @property
-    def pid(self) -> int:
-        ...
-
-    @property
-    def attached(self) -> bool:
-        ...
-
-    @attached.setter
-    def attached(self, value: bool):
-        ...
+    _manager: ProcessManager
+    pid: int
+    attached: bool
 
 
 class Attach:
@@ -720,7 +740,7 @@ class Process(Tube, Attach):
                     pass
 
                 child = pid == proc.pid
-                self = cls(manager, bio, pid, child)
+                self = cls(bio, pid, child, manager)
                 self.attached = bool(dbg)
 
             except Exception as e:
@@ -733,7 +753,7 @@ class Process(Tube, Attach):
 
         return self
 
-    def __init__(self, manager: ProcessManager, bio: BinaryIO, pid: int, child: bool):
+    def __init__(self, bio: BinaryIO, pid: int, child: bool, manager: ProcessManager):
         from typing import BinaryIO
         from os import pidfd_open, close
         from select import epoll, EPOLLIN
@@ -767,21 +787,14 @@ class Process(Tube, Attach):
 
     @Logger.send
     def _send(self, data: bytes) -> int:
-        if self._ready(True):
-            n = self._bio.write(data)
-            assert (n is not None)
-            return n
-        else:
-            return 0
+        self._ready(True)
+        return self._bio.write(data)
 
     @Logger.recv
     def _recv(self, size: int) -> bytes:
-        if self._ready(False):
-            data = self._bio.read(size)
-            assert (data is not None)
-            return data
-        else:
-            return b''
+        self._ready(False)
+        data = self._bio.read(size)
+        return data or b''
 
     def gettimeout(self) -> float | None:
         return self._timeout
@@ -789,21 +802,21 @@ class Process(Tube, Attach):
     def settimeout(self, timeout: float | None):
         self._timeout = timeout
 
-    def _ready(self, out: bool) -> bool:
+    def _ready(self, out: bool):
         from select import EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP
         from os import waitid, P_PIDFD, WEXITED, WNOWAIT
 
         mask = EPOLLOUT if out else EPOLLIN
         self._epollfd.modify(self._bio, mask)
         biofd = self._bio.fileno()
-        timeout = self.gettimeout()
+        timeout = self._timeout
 
         while ev := dict(self._epollfd.poll(timeout)):
             def chkfd(fd: int, flag: int) -> bool:
                 return bool(ev.get(fd, 0) & flag)
 
             if chkfd(biofd, EPOLLIN):
-                return True
+                return
 
             elif chkfd(self._pidfd, EPOLLIN):
                 if self._child:
@@ -816,17 +829,16 @@ class Process(Tube, Attach):
                 raise ProcessMonitoringError(status)
 
             elif chkfd(biofd, EPOLLOUT):
-                return True
+                return
 
             else:
                 assert (chkfd(biofd, EPOLLERR | EPOLLHUP) or
                         chkfd(self._pidfd, EPOLLERR | EPOLLHUP))
 
         assert (timeout is not None)
-        if not timeout:
-            return False
 
-        raise TimeoutError
+        if timeout:
+            raise TimeoutError
 
     def close(self):
         from os import close
@@ -848,12 +860,11 @@ class Local(Remote, Attach):
             ssl: SSLContext | None = None) -> Self:
 
         pid = cls.pidof(host, port, udp=udp, ipv6=ipv6)
-        sk = Net._socket(udp, ipv6, ssl)
+        sk = cls.multisk(udp, ipv6, ssl)
 
         try:
             sk.connect((host, port))
-            manager = ProcessManager()
-            return cls(manager, sk, pid)
+            return cls(sk, pid)
 
         except Exception as e:
             sk.close()
@@ -876,12 +887,9 @@ class Local(Remote, Attach):
                 pid = found.group(1)
                 pid = int(pid)
 
-                try:
+                with suppress(FileNotFoundError, PermissionError):
                     if readlink(i) == f'socket:[{inode}]':
                         return pid
-
-                except FileNotFoundError:
-                    pass
 
         raise FileNotFoundError
 
@@ -1006,50 +1014,116 @@ class Local(Remote, Attach):
 
         raise TimeoutError
 
-    def __init__(self, manager: ProcessManager, sk: socket, pid: int):
+    def __init__(self, sk: socket, pid: int):
         from os import pidfd_open, close
         from select import epoll, EPOLLIN
+        from time import CLOCK_MONOTONIC
 
         super().__init__(sk)
+        super().settimeout(0)
         pidfd = pidfd_open(pid)
 
         try:
-            epollfd = epoll(1)
+            timerfd = Linux.timerfd_create(CLOCK_MONOTONIC, 0)
 
             try:
-                epollfd.register(pidfd, EPOLLIN)
+                epollfd = epoll(3)
+
+                try:
+                    epollfd.register(sk, 0)
+                    epollfd.register(pidfd, EPOLLIN)
+                    epollfd.register(timerfd, EPOLLIN)
+
+                except Exception as e:
+                    epollfd.close()
+                    raise e
 
             except Exception as e:
-                epollfd.close()
+                close(timerfd)
                 raise e
 
         except Exception as e:
             close(pidfd)
             raise e
 
-        self._manager: ProcessManager = manager
+        self._manager: ProcessManager = ProcessManager()
         self.pid: int = pid
         self.attached: bool = False
+        self._timeout: float | None = None
         self._pidfd: int = pidfd
+        self._timerfd: int = timerfd
         self._epollfd: epoll = epollfd
 
     def _send(self, data: bytes) -> int:
-        self._exited()
-        return super()._send(data)
+        from ssl import SSLWantWriteError
+
+        if self._timeout == 0:
+            ignore = []
+        else:
+            ignore = [BlockingIOError, SSLWantWriteError]
+
+        self._settime()
+
+        while True:
+            self._ready(True)
+            with suppress(*ignore):
+                return super()._send(data)
 
     def _recv(self, size: int) -> bytes:
-        self._exited()
-        return super()._recv(size)
+        from ssl import SSLWantReadError
 
-    def _exited(self):
-        from select import EPOLLIN, EPOLLERR, EPOLLHUP
+        if self._timeout == 0:
+            ignore = []
+        else:
+            ignore = [BlockingIOError, SSLWantReadError]
+
+        self._settime()
+
+        while True:
+            self._ready(False)
+            with suppress(*ignore):
+                return super()._recv(size)
+
+    def gettimeout(self) -> float | None:
+        return self._timeout
+
+    def settimeout(self, timeout: float | None):
+        self._timeout = timeout
+
+    def _settime(self):
+        if self._timeout:
+            itime = [0, self._timeout]
+        else:
+            itime = [0, 0]
+
+        Linux.timerfd_settime(self._timerfd, 0, *itime)
+
+    def _ready(self, out: bool):
+        from select import EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP
         from os import waitid, P_PIDFD, WEXITED, WNOWAIT
+        from ssl import SSLSocket
 
-        if ev := dict(self._epollfd.poll(0)):
+        mask = EPOLLOUT if out else EPOLLIN
+        self._epollfd.modify(self._sk, mask)
+        sk = self._sk.fileno()
+        timeout = 0 if self._timeout == 0 else None
+
+        if not out:
+            if isinstance(self._sk, SSLSocket):
+                if self._sk.pending():
+                    return
+
+        while ev := dict(self._epollfd.poll(timeout)):
             def chkfd(fd: int, flag: int) -> bool:
                 return bool(ev.get(fd, 0) & flag)
 
-            if chkfd(self._pidfd, EPOLLIN):
+            if chkfd(self._timerfd, EPOLLIN):
+                raise TimeoutError
+
+            elif chkfd(sk, EPOLLIN):
+                return
+
+            elif chkfd(self._pidfd, EPOLLIN):
                 try:
                     result = waitid(P_PIDFD, self._pidfd, WEXITED | WNOWAIT)
                     assert (result)
@@ -1060,14 +1134,22 @@ class Local(Remote, Attach):
 
                 raise ProcessMonitoringError(status)
 
+            elif chkfd(sk, EPOLLOUT):
+                return
+
             else:
-                assert (chkfd(self._pidfd, EPOLLERR | EPOLLHUP))
+                assert (chkfd(sk, EPOLLERR | EPOLLHUP) or
+                        chkfd(self._pidfd, EPOLLERR | EPOLLHUP) or
+                        chkfd(self._timerfd, EPOLLERR | EPOLLHUP))
+
+        assert (timeout is not None)
 
     def close(self):
         from os import close
         super().close()
         self._manager.close()
         close(self._pidfd)
+        close(self._timerfd)
         self._epollfd.close()
 
 
@@ -1195,6 +1277,106 @@ class Rr:
         return AtExit(cls().replay())
 
 
+class Linux:
+    from ctypes import CDLL, Structure, POINTER, c_int, c_ulong
+    glibc = CDLL(None)
+
+    _timerfd_create = glibc.timerfd_create
+    _timerfd_create.restype = c_int
+    _timerfd_create.argtypes = [c_int, c_int]
+
+    class itimerspec(Structure):
+        from ctypes import Structure
+
+        class timespec(Structure):
+            from ctypes import c_long
+            c_time_t = c_long
+
+            _fields_ = [
+                ("sec", c_time_t),
+                ("nsec", c_long)
+            ]
+
+        _fields_ = [
+            ('interval', timespec),
+            ('value', timespec)
+        ]
+
+    _timerfd_settime = glibc.timerfd_settime
+    _timerfd_settime.restype = c_int
+    _timerfd_settime.argtypes = [
+        c_int,
+        c_int,
+        POINTER(itimerspec),
+        POINTER(itimerspec)
+    ]
+
+    _personality = glibc.personality
+    _personality.restype = c_int
+    _personality.argtypes = [c_ulong]
+
+    _prctl = glibc.prctl
+    _prctl.restype = c_int
+    _prctl.argtypes = [
+        c_int,
+        c_ulong,
+        c_ulong,
+        c_ulong,
+        c_ulong
+    ]
+
+    ADDR_NO_RANDOMIZE = 0x00040000
+
+    @staticmethod
+    def oserror():
+        from ctypes import get_errno
+        from os import strerror
+        errno = get_errno()
+        raise OSError(errno, strerror(errno))
+
+    @staticmethod
+    def timerfd_create(clockid: int, flags: int):
+        if (fd := Linux._timerfd_create(clockid, flags)) == -1:
+            Linux.oserror()
+        return fd
+
+    @staticmethod
+    def timerfd_settime(fd: int, flags: int, interval: float, value: float):
+        from math import modf
+
+        itime = Linux.itimerspec()
+
+        nsec, sec = modf(interval)
+        sec = int(sec)
+        nsec = int(nsec*(10**9))
+        itime.interval.sec = sec
+        itime.interval.nsec = nsec
+
+        nsec, sec = modf(value)
+        sec = int(sec)
+        nsec = int(nsec*(10**9))
+        itime.value.sec = sec
+        itime.value.usec = nsec
+
+        if Linux._timerfd_settime(fd, flags, itime, None) == -1:
+            Linux.oserror()
+
+    @staticmethod
+    def personality(persona: int) -> int:
+        if (persona := Linux._personality(persona)) == -1:
+            Linux.oserror()
+
+        return persona
+
+    @staticmethod
+    def pr_set_ptracer_any():
+        PR_SET_PTRACER = 0x59616d61
+        PR_SET_PTRACER_ANY = -1
+
+        if Linux._prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) == -1:
+            Linux.oserror()
+
+
 def main():
     from argparse import ArgumentParser
 
@@ -1215,99 +1397,66 @@ def main():
     exec_command(command, tty, env, aslr)
 
 
-def exec_command(command: list[str], tty: str, env: dict[str, str], aslr: bool):
+def exec_command(command: list[str], tty: str, env: dict[str, str], aslr: bool) -> NoReturn:
     def wsl() -> bool:
         from platform import uname
         return 'microsoft-standard' in uname().release
 
-    if tty:
-        from os import setsid, getsid, setpgid
-        from os import open, close, O_RDWR, O_NOCTTY
-        from os import dup2
-        from os import ctermid
-        from tty import setraw
-        from fcntl import ioctl
-        from termios import TIOCNOTTY, TIOCSCTTY
-        from signal import signal, SIG_IGN, SIGHUP, SIGCONT
-        from contextlib import contextmanager
-
-        @contextmanager
-        def sigign(num: int) -> Iterator[Any]:
-            handler = signal(num, SIG_IGN)
+    try:
+        if tty:
+            from os import setsid, getsid, setpgid
+            from os import open, O_RDWR, O_NOCTTY, O_CLOEXEC
+            from os import dup2
+            from os import ctermid
+            from tty import setraw
+            from fcntl import ioctl
+            from termios import TIOCNOTTY, TIOCSCTTY
+            from signal import signal, SIG_IGN, SIGHUP, SIGCONT
 
             try:
-                yield handler
-            finally:
-                signal(num, handler)
+                with suppress(PermissionError):
+                    setpgid(0, getsid(0))
+                setsid()
 
-        try:
-            try:
-                setpgid(0, getsid(0))
             except PermissionError:
-                pass
+                for i in [SIGHUP, SIGCONT]:
+                    signal(i, SIG_IGN)
+                fd = open(ctermid(), O_RDWR | O_NOCTTY | O_CLOEXEC)
+                ioctl(fd, TIOCNOTTY, 0)
 
-            setsid()
-
-        except PermissionError:
-            fd = open(ctermid(), O_RDWR | O_NOCTTY)
-
-            try:
-                with sigign(SIGHUP), sigign(SIGCONT):
-                    ioctl(fd, TIOCNOTTY, 0)
-            finally:
-                close(fd)
-
-        fd = open(tty, O_RDWR | O_NOCTTY)
-
-        try:
+            fd = open(tty, O_RDWR | O_NOCTTY | O_CLOEXEC)
             setraw(fd)
             ioctl(fd, TIOCSCTTY, 0)
-            dup2(fd, 0)
-            dup2(fd, 1)
-            dup2(fd, 2)
-        finally:
-            close(fd)
+            for i in range(3):
+                dup2(fd, i)
 
-    def oserror():
-        from ctypes import get_errno
-        from os import strerror
-        errno = get_errno()
-        raise OSError(errno, strerror(errno))
+        if not aslr:
+            persona = Linux.personality(0xffffffff)
 
-    if not aslr:
-        from ctypes import CDLL, c_int, c_ulong
+            if not persona & Linux.ADDR_NO_RANDOMIZE:
+                Linux.personality(persona | Linux.ADDR_NO_RANDOMIZE)
 
-        personality = CDLL(None).personality
-        personality.restype = c_int
-        personality.argtypes = [c_ulong]
-        ADDR_NO_RANDOMIZE = 0x00040000
+        if not wsl():
+            Linux.pr_set_ptracer_any()
 
-        if (persona := personality(0xffffffff)) == -1:
-            oserror()
+        from os import environ, execlp
+        from signal import signal, valid_signals, SIG_DFL
 
-        if not persona & ADDR_NO_RANDOMIZE:
-            if personality(persona | ADDR_NO_RANDOMIZE) == -1:
-                oserror()
+        for i in valid_signals():
+            with suppress(OSError):
+                signal(i, SIG_DFL)
 
-    if not wsl():
-        from ctypes import CDLL, c_int, c_ulong
+        environ.update(env)
+        execlp(command[0], *command)
 
-        prctl = CDLL(None).prctl
-        prctl.restype = c_int
-        prctl.argtypes = [c_int, c_ulong, c_ulong, c_ulong, c_ulong]
-        PR_SET_PTRACER = 0x59616d61
-        PR_SET_PTRACER_ANY = -1
-
-        if prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0, 0) == -1:
-            oserror()
-
-    from os import environ, execlp
-
-    environ.update(env)
-    execlp(command[0], *command)
+    except Exception:
+        from traceback import print_exc
+        print_exc()
+        exit(1)
 
 
 if __name__ == '__main__':
     main()
 else:
     Config.init()
+    gdb: Gdb = Gdb()

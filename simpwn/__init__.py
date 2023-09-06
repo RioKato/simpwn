@@ -1,5 +1,5 @@
 from .simpwn import *
-from .label import *
 from .fmtstr import *
 from .r2dr import *
-from . import syscall
+from . import glibc as glibc
+from . import syscall as syscall
