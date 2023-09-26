@@ -80,14 +80,14 @@ def p64(value: int, be: bool = False) -> bytes:
 
 def pf(value: float, be: bool = False) -> bytes:
     from struct import pack
-    format = ('<f', '>f')
-    return pack(format[be], value)
+    fmt = ('<f', '>f')
+    return pack(fmt[be], value)
 
 
 def pd(value: float, be: bool = False) -> bytes:
     from struct import pack
-    format = ('<d', '>d')
-    return pack(format[be], value)
+    fmt = ('<d', '>d')
+    return pack(fmt[be], value)
 
 
 def u8(data: bytes, signed: bool = False) -> int:
@@ -113,15 +113,15 @@ def u64(data: bytes, signed: bool = False, be: bool = False) -> int:
 def uf(data: bytes, be: bool = False) -> int:
     from struct import unpack
     assert (len(data) == 4)
-    format = ('<f', '>f')
-    return unpack(format[be], data)[0]
+    fmt = ('<f', '>f')
+    return unpack(fmt[be], data)[0]
 
 
 def ud(data: bytes, be: bool = False) -> int:
     from struct import unpack
     assert (len(data) == 8)
-    format = ('<d', '>d')
-    return unpack(format[be], data)[0]
+    fmt = ('<d', '>d')
+    return unpack(fmt[be], data)[0]
 
 
 def flat(*args: bytes) -> bytes:
@@ -302,13 +302,13 @@ def peep(value: Any, peepfmt: str | None = None) -> Any:
     args = unparse(args)
 
     if peepfmt:
-        message = peepfmt.format(lineno, args, value, **_COLOR)
+        message = str.format(peepfmt, lineno, args, value, **_COLOR)
         print(message)
 
     return value
 
 
-def hexdump(format: str, data: bytes) -> Iterator[str]:
+def hexdump(hdfmt: str, data: bytes) -> Iterator[str]:
     from string import Formatter
 
     class HexDumpFormatter(Formatter):
@@ -342,7 +342,7 @@ def hexdump(format: str, data: bytes) -> Iterator[str]:
 
     while data:
         fst, snd, data = data[:0x8], data[0x8:0x10], data[0x10:]
-        yield formatter.format(format, off, fst, snd, **_COLOR)
+        yield formatter.format(hdfmt, off, fst, snd, **_COLOR)
         off += 0x10
 
 
@@ -1216,6 +1216,16 @@ class Gdb(Debugger):
 
     def attach(self, pid: int) -> list[str]:
         command = [*self.term, self.gdb, '-p', f'{pid}']
+
+        if self.script:
+            command = [*command, '-x', self.script]
+
+        command = [*command, *self.opt]
+        return command
+
+    def remote(self, host: str, port: int) -> list[str]:
+        command = [*self.term, self.gdb]
+        command = [*command, '-ex', 'target', 'remote', f'{host}:{port}']
 
         if self.script:
             command = [*command, '-x', self.script]
