@@ -14,6 +14,7 @@ class Config:
     term: list[str] = ['tmux', 'split', '-h']
     gdb: str = 'gdb'
     rr: str = 'rr'
+    ltrace: str = 'ltrace'
     sendfmt: str = '{GREEN}{BOLD}<{END}{END} {CYAN}{0:04x}:{END} {1:!b}  {2:!b} | {1:!ul} {2:!ul} | {1:!s}{2:!s}'
     recvfmt: str = '{PURPLE}{BOLD}>{END}{END} {CYAN}{0:04x}:{END} {1:!b}  {2:!b} | {1:!ul} {2:!ul} | {1:!s}{2:!s}'
     peepfmt: str = '{RED}{BOLD}[L{0}]{END}{END} {1} = {2:#018x}'
@@ -1287,6 +1288,26 @@ class Rr:
         return AtExit(cls().replay())
 
 
+class LTrace(Debugger):
+    def __init__(self,
+                 opt: list[str] | None = None,
+                 term: list[str] | None = None,
+                 ltrace: str | None = None):
+
+        opt = opt if opt is not None else Config.opt
+        term = term if term is not None else Config.term
+        ltrace = ltrace if ltrace is not None else Config.ltrace
+
+        super().__init__()
+        self.opt: list[str] = opt
+        self.term: list[str] = term
+        self.ltrace: str = ltrace
+
+    def attach(self, pid: int) -> list[str]:
+        command = [*self.term, self.ltrace, '-p', f'{pid}', '-i', *self.opt]
+        return command
+
+
 class Linux:
     from ctypes import CDLL, Structure, POINTER, c_int, c_ulong
     glibc = CDLL(None)
@@ -1470,3 +1491,4 @@ if __name__ == '__main__':
 else:
     Config.init()
     gdb: Gdb = Gdb()
+    ltrace: LTrace = LTrace()
