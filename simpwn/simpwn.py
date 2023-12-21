@@ -15,6 +15,7 @@ class Config:
     gdb: str = 'gdb'
     rr: str = 'rr'
     ltrace: str = 'ltrace'
+    ucallg: str = 'ucallg'
     sendfmt: str = '{GREEN}{BOLD}<{END}{END} {CYAN}{0:04x}:{END} {1:!b}  {2:!b} | {1:!ul} {2:!ul} | {1:!s}{2:!s}'
     recvfmt: str = '{PURPLE}{BOLD}>{END}{END} {CYAN}{0:04x}:{END} {1:!b}  {2:!b} | {1:!ul} {2:!ul} | {1:!s}{2:!s}'
     peepfmt: str = '{RED}{BOLD}[L{0}]{END}{END} {1} = {2:#018x}'
@@ -1305,6 +1306,29 @@ class LTrace(Debugger):
 
     def attach(self, pid: int) -> list[str]:
         command = [*self.term, self.ltrace, '-p', f'{pid}', '-i', *self.opt]
+        return command
+
+
+class Ucallg(Debugger):
+    def __init__(self,
+                 module: str,
+                 opt: list[str] | None = None,
+                 term: list[str] | None = None,
+                 ucallg: str | None = None):
+
+        opt = opt if opt is not None else Config.opt
+        term = term if term is not None else Config.term
+        ucallg = ucallg if ucallg is not None else Config.ucallg
+
+        super().__init__()
+        self.module: str = module
+        self.opt: list[str] = opt
+        self.term: list[str] = term
+        self.ucallg: str = ucallg
+
+    def attach(self, pid: int) -> list[str]:
+        command = [*self.term, self.ucallg,
+                   'view', '-p', f'{pid}', *self.opt, self.module]
         return command
 
 
