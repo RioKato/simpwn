@@ -730,24 +730,27 @@ class Process(Tube, Attach):
             owner = ProcessOwner(proc)
 
             try:
+                if proc.poll():
+                    raise ValueError
+
                 while not (pid := tcgetpgrp(bio.fileno())):
                     pass
 
+                def child(pid: int) -> int:
+                    decimal = compile(r'\d+')
+                    dead = compile(r'^State:\s*[XZ]', MULTILINE)
+
+                    while True:
+                        with open(f'/proc/{pid}/status') as fd:
+                            if dead.search(fd.read()):
+                                raise ValueError
+
+                        for children in iglob(f'/proc/{pid}/task/*/children'):
+                            with suppress(FileNotFoundError), open(children) as fd:
+                                for found in decimal.finditer(fd.read()):
+                                    return int(found.group(0))
+
                 if dbg in ['rr']:
-                    def child(pid: int) -> int:
-                        decimal = compile(r'\d+')
-                        dead = compile(r'^State:\s*[XZ]', MULTILINE)
-
-                        while True:
-                            with open(f'/proc/{pid}/status') as fd:
-                                if dead.search(fd.read()):
-                                    raise FileNotFoundError
-
-                            for children in iglob(f'/proc/{pid}/task/*/children'):
-                                with suppress(FileNotFoundError), open(children) as fd:
-                                    for found in decimal.finditer(fd.read()):
-                                        return int(found.group(0))
-
                     pid = child(pid)
 
                 self = cls(bio, pid, proc.pid, owner)
