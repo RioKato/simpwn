@@ -1307,6 +1307,10 @@ class Rr(Debugger):
         else:
             register(lambda: exec_command(self.replay(), '', {}, True))
 
+    def rm_latest(self):
+        from subprocess import run
+        run(['rr', 'rm', 'latest-trace'])
+
 
 class LTrace(Debugger):
     def __init__(self,
