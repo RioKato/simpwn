@@ -1,5 +1,5 @@
 from contextlib import suppress
-from typing import Any, Callable, Iterator, NoReturn, Protocol, Self, Type, cast
+from typing import Any, Callable, Iterator, NoReturn, Protocol, Self, cast
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
 from functools import wraps
@@ -11,7 +11,7 @@ class Config:
     dbg: str = ''
     script: str = 'init.gdb'
     opt: list[str] = []
-    term: list[str] = ['tmux', 'split', '-h']
+    term: list[str] = ['tmux', 'split']
     gdb: str = 'gdb'
     rr: str = 'rr'
     ltrace: str = 'ltrace'
@@ -591,7 +591,7 @@ class ProcessMonitoringError(Exception):
         self.status: int | None = status
 
 
-class ProcessManager:
+class ProcessOwner:
     from subprocess import Popen
 
     def __init__(self, *proc: Popen, timeout: float = 0.1):
@@ -615,56 +615,47 @@ class ProcessManager:
                 p.wait()
 
 
-class AtExit:
-    def __init__(self, command: list[str]):
-        self._command: list[str] = command
+class Debugger:
+    from subprocess import Popen
 
-    def __enter__(self):
-        return self
+    def __init__(self, once: bool, pybreak: bool):
+        self.once: bool = once
+        self.pybreak: bool = pybreak
 
-    def __exit__(self, cls: Type, *_):
-        from subprocess import run
+    def build(self, _) -> list[str]:
+        raise NotImplementedError
 
-        if issubclass(cls, ProcessMonitoringError):
-            run(self._command)
-            return True
-
-        return False
-
-
-class Debugger(metaclass=ABCMeta):
-    @abstractmethod
-    def attach(self, pid: int) -> list[str]:
-        pass
+    def attach(self, pid: int) -> Popen | None:
+        from subprocess import Popen
+        return Popen(self.build(pid))
 
 
 class AttachProtocol(Protocol):
-    _manager: ProcessManager
+    owner: ProcessOwner
     pid: int
     attached: bool
 
 
 class Attach:
     def attach(self: AttachProtocol, debugger: Debugger):
-        from subprocess import Popen
         from os import getenv
         from pdb import Pdb
         from inspect import currentframe
 
-        if not self.attached:
+        if not debugger.once or not self.attached:
+            if proc := debugger.attach(self.pid):
+                self.owner.move(proc)
             self.attached = True
-            command = debugger.attach(self.pid)
-            proc = Popen(command)
-            self._manager.move(proc)
 
-        if getenv('PYTHONBREAKPOINT'):
-            breakpoint()
+        if debugger.pybreak:
+            if getenv('PYTHONBREAKPOINT'):
+                breakpoint()
 
-        else:
-            pdb = Pdb()
-            frame = currentframe()
-            assert (frame)
-            pdb.set_trace(frame.f_back)
+            else:
+                pdb = Pdb()
+                frame = currentframe()
+                assert (frame)
+                pdb.set_trace(frame.f_back)
 
 
 class Process(Tube, Attach):
@@ -712,6 +703,8 @@ class Process(Tube, Attach):
         from os import ttyname, tcgetpgrp
         from os import fdopen, close, O_NONBLOCK
         from subprocess import Popen
+        from glob import iglob
+        from re import compile, MULTILINE
 
         master, slave = openpty()
 
@@ -734,18 +727,34 @@ class Process(Tube, Attach):
             assert (dbg in cls._builder_)
             command = cls._builder_[opt_.dbg](command, opt_)
             proc = Popen(command)
-            manager = ProcessManager(proc)
+            owner = ProcessOwner(proc)
 
             try:
                 while not (pid := tcgetpgrp(bio.fileno())):
                     pass
 
-                child = pid == proc.pid
-                self = cls(bio, pid, child, manager)
+                if dbg in ['rr']:
+                    def child(pid: int) -> int:
+                        decimal = compile(r'\d+')
+                        dead = compile(r'^State:\s*[XZ]', MULTILINE)
+
+                        while True:
+                            with open(f'/proc/{pid}/status') as fd:
+                                if dead.search(fd.read()):
+                                    raise FileNotFoundError
+
+                            for children in iglob(f'/proc/{pid}/task/*/children'):
+                                with suppress(FileNotFoundError), open(children) as fd:
+                                    for found in decimal.finditer(fd.read()):
+                                        return int(found.group(0))
+
+                    pid = child(pid)
+
+                self = cls(bio, pid, proc.pid, owner)
                 self.attached = bool(dbg)
 
             except Exception as e:
-                manager.close()
+                owner.close()
                 raise e
 
         except Exception as e:
@@ -754,7 +763,7 @@ class Process(Tube, Attach):
 
         return self
 
-    def __init__(self, bio: BinaryIO, pid: int, child: bool, manager: ProcessManager):
+    def __init__(self, bio: BinaryIO, pid: int, ancestor: int, owner: ProcessOwner):
         from typing import BinaryIO
         from os import pidfd_open, close
         from select import epoll, EPOLLIN
@@ -777,13 +786,13 @@ class Process(Tube, Attach):
             close(pidfd)
             raise e
 
-        self._manager: ProcessManager = manager
+        self.owner: ProcessOwner = owner
         self.pid: int = pid
+        self.ancestor: int = ancestor
         self.attached: bool = False
         self._bio: BinaryIO = bio
         self._timeout: float | None = None
         self._pidfd: int = pidfd
-        self._child: bool = child
         self._epollfd: epoll = epollfd
 
     @Logger.send
@@ -820,7 +829,7 @@ class Process(Tube, Attach):
                 return
 
             elif chkfd(self._pidfd, EPOLLIN):
-                if self._child:
+                if self.pid == self.ancestor:
                     result = waitid(P_PIDFD, self._pidfd, WEXITED | WNOWAIT)
                     assert (result)
                     status = result.si_status
@@ -843,10 +852,14 @@ class Process(Tube, Attach):
 
     def close(self):
         from os import close
-        self._manager.close()
+        self.owner.close()
         self._bio.close()
         close(self._pidfd)
         self._epollfd.close()
+
+    def atexit(self):
+        from atexit import register
+        register(lambda: self.close())
 
 
 class Local(Remote, Attach):
@@ -1047,7 +1060,7 @@ class Local(Remote, Attach):
             close(pidfd)
             raise e
 
-        self._manager: ProcessManager = ProcessManager()
+        self.owner: ProcessOwner = ProcessOwner()
         self.pid: int = pid
         self.attached: bool = False
         self._timeout: float | None = None
@@ -1148,7 +1161,7 @@ class Local(Remote, Attach):
     def close(self):
         from os import close
         super().close()
-        self._manager.close()
+        self.owner.close()
         close(self._pidfd)
         close(self._timerfd)
         self._epollfd.close()
@@ -1209,13 +1222,13 @@ class Gdb(Debugger):
         term = term if term is not None else Config.term
         gdb = gdb if gdb is not None else Config.gdb
 
-        super().__init__()
+        super().__init__(True, True)
         self.script: str = script
         self.opt: list[str] = opt
         self.term: list[str] = term
         self.gdb: str = gdb
 
-    def attach(self, pid: int) -> list[str]:
+    def build(self, pid: int) -> list[str]:
         command = [*self.term, self.gdb, '-p', f'{pid}']
 
         if self.script:
@@ -1224,18 +1237,10 @@ class Gdb(Debugger):
         command = [*command, *self.opt]
         return command
 
-    def remote(self, host: str, port: int) -> list[str]:
-        command = [*self.term, self.gdb]
-        command = [*command, '-ex', 'target', 'remote', f'{host}:{port}']
 
-        if self.script:
-            command = [*command, '-x', self.script]
+class Rr(Debugger):
+    from subprocess import Popen
 
-        command = [*command, *self.opt]
-        return command
-
-
-class Rr:
     @Process.dbg('rr')
     @staticmethod
     def record(command: list[str], opt: Process.Opt) -> list[str]:
@@ -1269,10 +1274,17 @@ class Rr:
         term = term if term is not None else Config.term
         rr = rr if rr is not None else Config.rr
 
+        super().__init__(False, False)
         self.script: str = script
         self.opt: list[str] = opt
         self.term: list[str] = term
         self.rr: str = rr
+
+    def attach(self, pid: int) -> Popen | None:
+        from os import kill
+        from signal import SIGCONT
+        kill(pid, SIGCONT)
+        return None
 
     def replay(self) -> list[str]:
         command = [*self.term, self.rr, 'replay']
@@ -1283,9 +1295,14 @@ class Rr:
         command = [*command, *self.opt]
         return command
 
-    @classmethod
-    def atexit(cls) -> AtExit:
-        return AtExit(cls().replay())
+    def atexit(self):
+        from atexit import register
+        from subprocess import run
+
+        if self.term:
+            register(lambda: run(self.replay()))
+        else:
+            register(lambda: exec_command(self.replay(), '', {}, True))
 
 
 class LTrace(Debugger):
@@ -1298,12 +1315,12 @@ class LTrace(Debugger):
         term = term if term is not None else Config.term
         ltrace = ltrace if ltrace is not None else Config.ltrace
 
-        super().__init__()
+        super().__init__(True, True)
         self.opt: list[str] = opt
         self.term: list[str] = term
         self.ltrace: str = ltrace
 
-    def attach(self, pid: int) -> list[str]:
+    def build(self, pid: int) -> list[str]:
         command = [*self.term, self.ltrace, '-p', f'{pid}', '-i', *self.opt]
         return command
 
@@ -1491,4 +1508,5 @@ if __name__ == '__main__':
 else:
     Config.init()
     gdb: Gdb = Gdb()
+    rr: Rr = Rr()
     ltrace: LTrace = LTrace()
