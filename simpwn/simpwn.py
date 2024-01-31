@@ -1309,7 +1309,7 @@ class Rr(Debugger):
 
     def rm_latest(self):
         from subprocess import run
-        run(['rr', 'rm', 'latest-trace'])
+        run([self.rr, 'rm', 'latest-trace'])
 
 
 class LTrace(Debugger):
