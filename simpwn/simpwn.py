@@ -14,7 +14,6 @@ class Config:
     term: list[str] = ['tmux', 'split']
     gdb: str = 'gdb'
     rr: str = 'rr'
-    pgrep: str = 'pgrep'
     ltrace: str = 'ltrace'
     sendfmt: str = '{GREEN}{BOLD}<{END}{END} {CYAN}{0:04x}:{END} {1:!b}  {2:!b} | {1:!ul} {2:!ul} | {1:!s}{2:!s}'
     recvfmt: str = '{PURPLE}{BOLD}>{END}{END} {CYAN}{0:04x}:{END} {1:!b}  {2:!b} | {1:!ul} {2:!ul} | {1:!s}{2:!s}'
@@ -735,10 +734,7 @@ class Process(Tube, Attach):
                 while not (pid := tcgetpgrp(bio.fileno())):
                     pass
 
-                if dbg in ['rr']:
-                    pid = proc.pid
-
-                self = cls(bio, pid, proc.pid, owner)
+                self = cls(bio, pid, pid == proc.pid, owner)
                 self.attached = bool(dbg)
 
             except Exception as e:
@@ -751,7 +747,7 @@ class Process(Tube, Attach):
 
         return self
 
-    def __init__(self, bio: BinaryIO, pid: int, ancestor: int, owner: ProcessOwner):
+    def __init__(self, bio: BinaryIO, pid: int, child: bool, owner: ProcessOwner):
         from typing import BinaryIO
         from os import pidfd_open, close
         from select import epoll, EPOLLIN
@@ -776,7 +772,7 @@ class Process(Tube, Attach):
 
         self.owner: ProcessOwner = owner
         self.pid: int = pid
-        self.ancestor: int = ancestor
+        self.child: bool = child
         self.attached: bool = False
         self._bio: BinaryIO = bio
         self._timeout: float | None = None
@@ -817,7 +813,7 @@ class Process(Tube, Attach):
                 return
 
             elif chkfd(self._pidfd, EPOLLIN):
-                if self.pid == self.ancestor:
+                if self.child:
                     result = waitid(P_PIDFD, self._pidfd, WEXITED | WNOWAIT)
                     assert (result)
                     status = result.si_status
@@ -1255,37 +1251,18 @@ class Rr(Debugger):
                  script: str | None = None,
                  opt: list[str] | None = None,
                  term: list[str] | None = None,
-                 rr: str | None = None,
-                 pgrep: str | None = None):
+                 rr: str | None = None):
 
         script = script if script is not None else Config.script
         opt = opt if opt is not None else Config.opt
         term = term if term is not None else Config.term
         rr = rr if rr is not None else Config.rr
-        pgrep = pgrep if pgrep is not None else Config.pgrep
 
         super().__init__(False, False)
         self.script: str = script
         self.opt: list[str] = opt
         self.term: list[str] = term
         self.rr: str = rr
-        self.pgrep: str = pgrep
-
-    def attach(self, pid: int) -> Popen | None:
-        from subprocess import run
-        from re import compile
-        from os import kill
-        from signal import SIGCONT
-
-        number = compile(r"\d+")
-        result = run([self.pgrep, '-P', f'{pid}'],
-                     capture_output=True, text=True)
-        children = number.findall(result.stdout)
-        children = [int(child) for child in children]
-        assert (len(children) < 2)
-        if children:
-            kill(children[0], SIGCONT)
-        return None
 
     def replay(self) -> list[str]:
         command = [*self.term, self.rr, 'replay']
@@ -1305,7 +1282,7 @@ class Rr(Debugger):
         else:
             register(lambda: exec_command(self.replay(), '', {}, True))
 
-    def rm_latest(self):
+    def remove(self):
         from subprocess import run
         run([self.rr, 'rm', 'latest-trace'])
 
