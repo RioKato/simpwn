@@ -623,7 +623,7 @@ class Debugger:
         self.once: bool = once
         self.pybreak: bool = pybreak
 
-    def build(self, _) -> list[str]:
+    def build(self, _: int) -> list[str]:
         raise NotImplementedError
 
     def attach(self, pid: int) -> Popen | None:
