@@ -14,6 +14,7 @@ class Config:
     term: list[str] = ['tmux', 'split']
     gdb: str = 'gdb'
     rr: str = 'rr'
+    rrkill: str = 'signal-rr-recording'
     ltrace: str = 'ltrace'
     sendfmt: str = '{GREEN}{BOLD}<{END}{END} {CYAN}{0:04x}:{END} {1:!b}  {2:!b} | {1:!ul} {2:!ul} | {1:!s}{2:!s}'
     recvfmt: str = '{PURPLE}{BOLD}>{END}{END} {CYAN}{0:04x}:{END} {1:!b}  {2:!b} | {1:!ul} {2:!ul} | {1:!s}{2:!s}'
@@ -1251,18 +1252,24 @@ class Rr(Debugger):
                  script: str | None = None,
                  opt: list[str] | None = None,
                  term: list[str] | None = None,
-                 rr: str | None = None):
+                 rr: str | None = None,
+                 rrkill: str | None = None):
 
         script = script if script is not None else Config.script
         opt = opt if opt is not None else Config.opt
         term = term if term is not None else Config.term
         rr = rr if rr is not None else Config.rr
+        rrkill = rrkill if rrkill is not None else Config.rrkill
 
         super().__init__(False, False)
         self.script: str = script
         self.opt: list[str] = opt
         self.term: list[str] = term
         self.rr: str = rr
+        self.rrkill: str = rrkill
+
+    def build(self, _) -> list[str]:
+        return [self.rrkill, 'SIGCONT']
 
     def replay(self) -> list[str]:
         command = [*self.term, self.rr, 'replay']
